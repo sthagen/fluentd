@@ -192,6 +192,7 @@ module Fluent
 
         @stage_size = @queue_size = 0
         @timekeys = Hash.new(0)
+        @enable_update_timekeys = false
         @mutex = Mutex.new
       end
 
@@ -207,24 +208,23 @@ module Fluent
         end
       end
 
+      def enable_update_timekeys
+        @enable_update_timekeys = true
+      end
+
       def start
         super
 
         @stage, @queue = resume
         @stage.each_pair do |metadata, chunk|
           @stage_size += chunk.bytesize
-          if chunk.metadata && chunk.metadata.timekey
-            add_timekey(metadata.timekey)
-          end
         end
         @queue.each do |chunk|
           @queued_num[chunk.metadata] ||= 0
           @queued_num[chunk.metadata] += 1
           @queue_size += chunk.bytesize
-          if chunk.metadata && chunk.metadata.timekey
-            add_timekey(chunk.metadata.timekey)
-          end
         end
+        update_timekeys
         log.debug "buffer started", instance: self.object_id, stage_size: @stage_size, queue_size: @queue_size
       end
 
@@ -273,12 +273,9 @@ module Fluent
         Metadata.new(timekey, tag, variables)
       end
 
+      # Keep this method for existing code
       def metadata(timekey: nil, tag: nil, variables: nil)
-        meta = Metadata.new(timekey, tag, variables)
-        if (t = meta.timekey)
-          add_timekey(t)
-        end
-        meta
+        Metadata.new(timekey, tag, variables)
       end
 
       def timekeys
@@ -472,9 +469,23 @@ module Fluent
         end
       end
 
+      def update_timekeys
+        synchronize do
+          chunks = @stage.values
+          chunks.concat(@queue)
+          @timekeys = chunks.each_with_object({}) do |chunk, keys|
+            if chunk.metadata && chunk.metadata.timekey
+              t = chunk.metadata.timekey
+              keys[t] = keys.fetch(t, 0) + 1
+            end
+          end
+        end
+      end
+
       # At flush_at_shutdown, all staged chunks should be enqueued for buffer flush. Set true to force_enqueue for it.
       def enqueue_all(force_enqueue = false)
         log.on_trace { log.trace "enqueueing all chunks in buffer", instance: self.object_id }
+        update_timekeys if @enable_update_timekeys
 
         if block_given?
           synchronize{ @stage.keys }.each do |metadata|
@@ -551,10 +562,6 @@ module Fluent
             @dequeued_num.delete(metadata)
           end
           log.trace "chunk purged", instance: self.object_id, chunk_id: dump_unique_id_hex(chunk_id), metadata: metadata
-        end
-
-        if metadata && metadata.timekey
-          del_timekey(metadata.timekey)
         end
 
         nil
@@ -788,11 +795,11 @@ module Fluent
           'total_queued_size' => stage_size + queue_size,
         }
 
-        if (m = timekeys.min)
+        tkeys = timekeys
+        if (m = tkeys.min)
           stats['oldest_timekey'] = m
         end
-
-        if (m = timekeys.max)
+        if (m = tkeys.max)
           stats['newest_timekey'] = m
         end
 
@@ -808,24 +815,6 @@ module Fluent
         else
           !@queue.empty?
         end
-      end
-
-      def add_timekey(t)
-        @mutex.synchronize do
-          @timekeys[t] += 1
-        end
-        nil
-      end
-
-      def del_timekey(t)
-        @mutex.synchronize do
-          if @timekeys[t] <= 1
-            @timekeys.delete(t)
-          else
-            @timekeys[t] -= 1
-          end
-        end
-        nil
       end
     end
   end
