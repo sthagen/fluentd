@@ -277,11 +277,16 @@ EOL
 </service_discovery>
     ])
 
-    assert_equal 2, d.instance.discovery_manager.services.size
-    assert_equal '127.0.0.1', d.instance.discovery_manager.services[0].host
-    assert_equal 1234, d.instance.discovery_manager.services[0].port
-    assert_equal '127.0.0.1', d.instance.discovery_manager.services[1].host
-    assert_equal 1235, d.instance.discovery_manager.services[1].port
+
+    assert_equal(
+      [
+        { host: '127.0.0.1', port: 1234 },
+        { host: '127.0.0.1', port: 1235 },
+      ],
+      d.instance.discovery_manager.services.collect do |service|
+        { host: service.host, port: service.port }
+      end
+    )
   end
 
   test 'pass username and password as empty string to HandshakeProtocol' do
@@ -367,8 +372,29 @@ EOL
       require_ack_response true
       ack_response_timeout 2s
     ])
+    d.instance_start
     assert d.instance.require_ack_response
     assert_equal 2, d.instance.ack_response_timeout
+  end
+
+  test 'suspend_flush is disable before before_shutdown' do
+    @d = d = create_driver(CONFIG + %[
+      require_ack_response true
+      ack_response_timeout 2s
+    ])
+    d.instance_start
+    assert_false d.instance.instance_variable_get(:@suspend_flush)
+  end
+
+  test 'suspend_flush should be enabled and try_flush returns nil after before_shutdown' do
+    @d = d = create_driver(CONFIG + %[
+      require_ack_response true
+      ack_response_timeout 2s
+    ])
+    d.instance_start
+    d.instance.before_shutdown
+    assert_true d.instance.instance_variable_get(:@suspend_flush)
+    assert_nil d.instance.try_flush
   end
 
   test 'verify_connection_at_startup is disabled in default' do
@@ -566,30 +592,87 @@ EOL
         flush_mode immediate
         retry_type periodic
         retry_wait 30s
-        flush_at_shutdown false # suppress errors in d.instance_shutdown
+        flush_at_shutdown true
       </buffer>
     ])
 
     time = event_time("2011-01-02 13:14:15 UTC")
 
     acked_chunk_ids = []
+    nacked = false
     mock.proxy(d.instance.ack_handler).read_ack_from_sock(anything) do |info, success|
       if success
         acked_chunk_ids << info.chunk_id
+      else
+        nacked = true
       end
-      [chunk_id, success]
+      [info, success]
     end
 
     records = [
       {"a" => 1},
       {"a" => 2}
     ]
-    target_input_driver.run(expect_records: 2) do
-      d.end_if { acked_chunk_ids.size > 0 }
+    target_input_driver.run(expect_records: 2, timeout: 5) do
+      d.end_if { acked_chunk_ids.size > 0 || nacked }
       d.run(default_tag: 'test', wait_flush_completion: false, shutdown: false) do
         d.feed([[time, records[0]], [time,records[1]]])
       end
     end
+
+    assert(!nacked, d.instance.log.logs.join)
+
+    events = target_input_driver.events
+    assert_equal ['test', time, records[0]], events[0]
+    assert_equal ['test', time, records[1]], events[1]
+
+    assert_equal 1, acked_chunk_ids.size
+    assert_equal d.instance.sent_chunk_ids.first, acked_chunk_ids.first
+  end
+
+  test 'a node supporting responses after stop' do
+    target_input_driver = create_target_input_driver
+
+    @d = d = create_driver(CONFIG + %[
+      require_ack_response true
+      ack_response_timeout 1s
+      <buffer tag>
+        flush_mode immediate
+        retry_type periodic
+        retry_wait 30s
+        flush_at_shutdown true
+      </buffer>
+    ])
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+
+    acked_chunk_ids = []
+    nacked = false
+    mock.proxy(d.instance.ack_handler).read_ack_from_sock(anything) do |info, success|
+      if success
+        acked_chunk_ids << info.chunk_id
+      else
+        nacked = true
+      end
+      [info, success]
+    end
+
+    records = [
+      {"a" => 1},
+      {"a" => 2}
+    ]
+    target_input_driver.run(expect_records: 2, timeout: 5) do
+      d.end_if { acked_chunk_ids.size > 0 || nacked }
+      d.run(default_tag: 'test', wait_flush_completion: false, shutdown: false) do
+        d.instance.stop
+        d.feed([[time, records[0]], [time,records[1]]])
+        d.instance.before_shutdown
+        d.instance.shutdown
+        d.instance.after_shutdown
+      end
+    end
+
+    assert(!nacked, d.instance.log.logs.join)
 
     events = target_input_driver.events
     assert_equal ['test', time, records[0]], events[0]
@@ -995,7 +1078,7 @@ EOL
   test 'when out_forward has @id' do
     # cancel https://github.com/fluent/fluentd/blob/077508ac817b7637307434d0c978d7cdc3d1c534/lib/fluent/plugin_id.rb#L43-L53
     # it always return true in test
-    mock.proxy(Fluent::Plugin).new_sd(:static, anything) { |v|
+    mock.proxy(Fluent::Plugin).new_sd('static', parent: anything) { |v|
       stub(v).plugin_id_for_test? { false }
     }.once
 
@@ -1137,6 +1220,8 @@ EOL
   end
 
   test 'Create new connection per send_data' do
+    omit "Proxy of RR doesn't support kwargs of Ruby 3 yet" if RUBY_VERSION.split('.')[0].to_i >= 3
+
     target_input_driver = create_target_input_driver(conf: TARGET_CONFIG)
     output_conf = CONFIG
     d = create_driver(output_conf)
@@ -1175,6 +1260,8 @@ EOL
 
   sub_test_case 'keepalive' do
     test 'Do not create connection per send_data' do
+      omit "Proxy of RR doesn't support kwargs of Ruby 3 yet" if RUBY_VERSION.split('.')[0].to_i >= 3
+
       target_input_driver = create_target_input_driver(conf: TARGET_CONFIG)
       output_conf = CONFIG + %[
         keepalive true
@@ -1222,7 +1309,13 @@ EOL
 
         begin
           chunk = Fluent::Plugin::Buffer::MemoryChunk.new(Fluent::Plugin::Buffer::Metadata.new(nil, nil, nil))
-          mock.proxy(d.instance).socket_create_tcp(TARGET_HOST, TARGET_PORT, anything) { |sock| mock(sock).close.once; sock }.twice
+          mock.proxy(d.instance).socket_create_tcp(TARGET_HOST, TARGET_PORT,
+                                                   linger_timeout: anything,
+                                                   send_timeout: anything,
+                                                   recv_timeout: anything,
+                                                   connect_timeout: anything) { |sock|
+            mock(sock).close.once; sock
+          }.twice
 
           target_input_driver.run(timeout: 15) do
             d.run(shutdown: false) do

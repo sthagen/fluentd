@@ -34,7 +34,8 @@ Gem::Specification.new do |gem|
   fake_platform = ENV['GEM_BUILD_FAKE_PLATFORM'].to_s
   gem.platform = fake_platform unless fake_platform.empty?
   if /mswin|mingw/ =~ fake_platform || (/mswin|mingw/ =~ RUBY_PLATFORM && fake_platform.empty?)
-    gem.add_runtime_dependency("win32-service", ["~> 2.1.5"])
+    gem.add_runtime_dependency("win32-api", [">= 1.10", "< 2.0.0"])
+    gem.add_runtime_dependency("win32-service", ["~> 2.2.0"])
     gem.add_runtime_dependency("win32-ipc", ["~> 0.7.0"])
     gem.add_runtime_dependency("win32-event", ["~> 0.6.3"])
     gem.add_runtime_dependency("windows-pr", ["~> 1.2.6"])
@@ -45,7 +46,7 @@ Gem::Specification.new do |gem|
   gem.add_development_dependency("flexmock", ["~> 2.0"])
   gem.add_development_dependency("parallel_tests", ["~> 0.15.3"])
   gem.add_development_dependency("simplecov", ["~> 0.7"])
-  gem.add_development_dependency("rr", ["~> 1.0"])
+  gem.add_development_dependency("rr", ["~> 3.0"])
   gem.add_development_dependency("timecop", ["~> 0.9"])
   gem.add_development_dependency("test-unit", ["~> 3.3"])
   gem.add_development_dependency("test-unit-rr", ["~> 1.0"])

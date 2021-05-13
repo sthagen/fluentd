@@ -105,7 +105,7 @@ Generate a project skeleton for creating a Fluentd plugin
 
 Arguments:
 \ttype: #{SUPPORTED_TYPES.join(",")}
-\tname: Your plugin name
+\tname: Your plugin name (fluent-plugin- prefix will be added to <name>)
 
 Options:
 BANNER
@@ -149,6 +149,36 @@ BANNER
 
   def plugin_name
     underscore_name
+  end
+
+  def gem_file_path
+    File.expand_path(File.join(File.dirname(__FILE__),
+                               "../../../",
+                               "Gemfile"))
+  end
+
+  def lock_file_path
+    File.expand_path(File.join(File.dirname(__FILE__),
+                               "../../../",
+                               "Gemfile.lock"))
+  end
+
+  def locked_gem_version(gem_name)
+    d = Bundler::Definition.build(gem_file_path, lock_file_path, false)
+    d.locked_gems.dependencies[gem_name].requirement.requirements.first.last.version
+  end
+
+  def rake_version
+    locked_gem_version("rake")
+  end
+
+  def test_unit_version
+    locked_gem_version("test-unit")
+  end
+
+  def bundler_version
+    d = Bundler::Definition.build(gem_file_path, lock_file_path, false)
+    d.locked_gems.bundler_version.version
   end
 
   def class_name

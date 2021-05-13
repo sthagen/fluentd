@@ -6,6 +6,8 @@ require 'fluent/system_config'
 require 'net/http'
 require 'flexmock/test_unit'
 require 'timecop'
+require 'tmpdir'
+require 'securerandom'
 
 class TailInputTest < Test::Unit::TestCase
   include FlexMock::TestCase
@@ -22,28 +24,64 @@ class TailInputTest < Test::Unit::TestCase
   end
 
   def cleanup_directory(path)
-    begin
-      FileUtils.rm_f(path, secure: true)
-    rescue ArgumentError
-      FileUtils.rm_f(path) # For Ruby 2.6 or before.
+    unless Dir.exist?(path)
+      FileUtils.mkdir_p(path)
+      return
     end
-    if File.exist?(path)
-      FileUtils.remove_entry_secure(path, true)
+
+    if Fluent.windows?
+      Dir.glob("*", base: path).each do |name|
+        begin
+          cleanup_file(File.join(path, name))
+        rescue
+          # expect test driver block release already owned file handle.
+        end
+      end
+    else
+      begin
+        FileUtils.rm_f(path, secure:true)
+      rescue ArgumentError
+        FileUtils.rm_f(path) # For Ruby 2.6 or before.
+      end
+      if File.exist?(path)
+        FileUtils.remove_entry_secure(path, true)
+      end
     end
     FileUtils.mkdir_p(path)
   end
 
   def cleanup_file(path)
-    begin
-      FileUtils.rm_f(path, secure: true)
-    rescue ArgumentError
-      FileUtils.rm_f(path) # For Ruby 2.6 or before.
-    end
-    if File.exist?(path)
-      # ensure files are closed for Windows, on which deleted files
-      # are still visible from filesystem
-      GC.start(full_mark: true, immediate_mark: true, immediate_sweep: true)
-      FileUtils.remove_entry_secure(path, true)
+    if Fluent.windows?
+      # On Windows, when the file or directory is removed and created
+      # frequently, there is a case that creating file or directory will
+      # fail. This situation is caused by pending file or directory
+      # deletion which is mentioned on win32 API document [1]
+      # As a workaround, execute rename and remove method.
+      #
+      # [1] https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea#files
+      #
+      file = File.join(Dir.tmpdir, SecureRandom.hex(10))
+      begin
+        FileUtils.mv(path, file)
+        FileUtils.rm_rf(file, secure: true)
+      rescue ArgumentError
+        FileUtils.rm_rf(file) # For Ruby 2.6 or before.
+      end
+      if File.exist?(file)
+        # ensure files are closed for Windows, on which deleted files
+        # are still visible from filesystem
+        GC.start(full_mark: true, immediate_mark: true, immediate_sweep: true)
+        FileUtils.remove_entry_secure(file, true)
+      end
+    else
+      begin
+        FileUtils.rm_f(path, secure: true)
+      rescue ArgumentError
+        FileUtils.rm_f(path) # For Ruby 2.6 or before.
+      end
+      if File.exist?(path)
+        FileUtils.remove_entry_secure(path, true)
+      end
     end
   end
 
@@ -118,6 +156,7 @@ class TailInputTest < Test::Unit::TestCase
       assert_equal 2, d.instance.rotate_wait
       assert_equal "#{TMP_DIR}/tail.pos", d.instance.pos_file
       assert_equal 1000, d.instance.read_lines_limit
+      assert_equal -1, d.instance.read_bytes_limit_per_second
       assert_equal false, d.instance.ignore_repeated_permission_error
       assert_nothing_raised do
         d.instance.have_read_capability?
@@ -154,6 +193,22 @@ class TailInputTest < Test::Unit::TestCase
     test "follow_inodes w/o pos file" do
       assert_raise(Fluent::ConfigError) do
         create_driver(CONFIG + config_element('', '', {'follow_inodes' => 'true'}))
+      end
+    end
+
+    sub_test_case "log throttling per file" do
+      test "w/o watcher timer is invalid" do
+        conf = CONFIG_ENABLE_WATCH_TIMER + config_element("ROOT", "", {"read_bytes_limit_per_second" => "8k"})
+        assert_raise(Fluent::ConfigError) do
+          create_driver(conf)
+        end
+      end
+
+      test "valid" do
+        conf = config_element("ROOT", "", {"read_bytes_limit_per_second" => "8k"})
+        assert_raise(Fluent::ConfigError) do
+          create_driver(conf)
+        end
       end
     end
 
@@ -283,6 +338,61 @@ class TailInputTest < Test::Unit::TestCase
       assert_equal({"message" => msg}, events[0][2])
       assert_equal({"message" => msg}, events[1][2])
       assert num_events <= d.emit_count
+    end
+
+    sub_test_case "log throttling per file" do
+      teardown do
+        cleanup_file("#{TMP_DIR}/tail.txt")
+      end
+
+      data("flat 8192 bytes, 2 events"        => [:flat, 100, 8192, 2],
+           "flat 8192 bytes, 2 events w/o stat watcher" => [:flat_without_stat, 100, 8192, 2],
+           "flat #{8192*10} bytes, 20 events"  => [:flat, 100, (8192 * 10), 20],
+           "flat #{8192*10} bytes, 20 events w/o stat watcher"  => [:flat_without_stat, 100, (8192 * 10), 20],
+           "parse #{8192*4} bytes, 8 events"  => [:parse, 100, (8192 * 4), 8],
+           "parse #{8192*4} bytes, 8 events w/o stat watcher"  => [:parse_without_stat, 100, (8192 * 4), 8],
+           "parse #{8192*10} bytes, 20 events" => [:parse, 100, (8192 * 10), 20],
+           "parse #{8192*10} bytes, 20 events w/o stat watcher" => [:parse_without_stat, 100, (8192 * 10), 20],
+           "flat 8k bytes with unit, 2 events"        => [:flat, 100, "8k", 2],
+           "flat 8k bytes with unit, 2 events w/o stat watcher"        => [:flat_without_stat, 100, "8k", 2],
+           "flat #{8*10}k bytes with unit, 20 events"  => [:flat, 100, "#{8*10}k", 20],
+           "flat #{8*10}k bytes with unit, 20 events w/o stat watcher"  => [:flat_without_stat, 100, "#{8*10}k", 20],
+           "parse #{8*4}k bytes with unit, 8 events"  => [:parse, 100, "#{8*4}k", 8],
+           "parse #{8*4}k bytes with unit, 8 events w/o stat watcher"  => [:parse_without_stat, 100, "#{8*4}k", 8],
+           "parse #{8*10}k bytes with unit, 20 events" => [:parse, 100, "#{8*10}k", 20],
+           "parse #{8*10}k bytes with unit, 20 events w/o stat watcher" => [:parse_without_stat, 100, "#{8*10}k", 20])
+      def test_emit_with_read_bytes_limit_per_second(data)
+        config_style, limit, limit_bytes, num_events = data
+        case config_style
+        when :flat
+          config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes })
+        when :parse
+          config = CONFIG_READ_FROM_HEAD + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes }) + PARSE_SINGLE_LINE_CONFIG
+        when :flat_without_stat
+          config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + CONFIG_DISABLE_STAT_WATCHER + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes })
+        when :parse_without_stat
+          config = CONFIG_READ_FROM_HEAD + CONFIG_DISABLE_STAT_WATCHER + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes }) + PARSE_SINGLE_LINE_CONFIG
+        end
+        d = create_driver(config)
+        msg = 'test' * 2000 # in_tail reads 8192 bytes at once.
+
+        # We should not do shutdown here due to hard timeout.
+        d.run(expect_emits: 2, shutdown: false) do
+          File.open("#{TMP_DIR}/tail.txt", "ab") {|f|
+            for _x in 0..30
+              f.puts msg
+            end
+          }
+        end
+
+        events = d.events
+        assert_true(events.length <= num_events)
+        assert_equal({"message" => msg}, events[0][2])
+        assert_equal({"message" => msg}, events[1][2])
+
+        # Teardown in_tail plugin instance here.
+        d.instance.shutdown
+      end
     end
 
     data(flat: CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG,
@@ -551,6 +661,7 @@ class TailInputTest < Test::Unit::TestCase
     File.open("#{TMP_DIR}/tail.txt", "wb") {|f|
       f.puts "test1"
       f.puts "test2"
+      f.flush
     }
 
     d = create_driver(config)
@@ -560,19 +671,23 @@ class TailInputTest < Test::Unit::TestCase
         f.puts "test3\ntest4"
         f.flush
       }
-      sleep 1
+      waiting(2) { sleep 0.1 until d.events.length == 2 }
       File.truncate("#{TMP_DIR}/tail.txt", 6)
     end
 
-    events = d.events
-    assert_equal(3, events.length)
-    assert_equal({"message" => "test3"}, events[0][2])
-    assert_equal({"message" => "test4"}, events[1][2])
-    assert_equal({"message" => "test1"}, events[2][2])
-    assert(events[0][1].is_a?(Fluent::EventTime))
-    assert(events[1][1].is_a?(Fluent::EventTime))
-    assert(events[2][1].is_a?(Fluent::EventTime))
-    assert_equal(2, d.emit_count)
+    expected = {
+      emit_count: 2,
+      events: [
+        [Fluent::EventTime, {"message" => "test3"}],
+        [Fluent::EventTime, {"message" => "test4"}],
+        [Fluent::EventTime, {"message" => "test1"}],
+      ]
+    }
+    actual = {
+      emit_count: d.emit_count,
+      events: d.events.collect{|event| [event[1].class, event[2]]}
+    }
+    assert_equal(expected, actual)
   end
 
   def test_move_truncate_move_back
@@ -1875,5 +1990,23 @@ class TailInputTest < Test::Unit::TestCase
     # detect a file at first execution of in_tail_refresh_watchers timer
     waiting(5) { sleep 0.1 until d.instance.instance_variable_get(:@tails).keys.size == 1 }
     d.instance_shutdown
+  end
+
+  def test_ENOENT_error_after_setup_watcher
+    path = "#{TMP_DIR}/tail.txt"
+    FileUtils.touch(path)
+    config = config_element('', '', {
+                              'format' => 'none',
+                            })
+    d = create_driver(config)
+    mock.proxy(d.instance).setup_watcher(anything, anything) do |tw|
+      cleanup_file(path)
+      tw
+    end
+    assert_nothing_raised do
+      d.run(shutdown: false) {}
+    end
+    d.instance_shutdown
+    assert($log.out.logs.any?{|log| log.include?("stat() for #{path} failed with ENOENT. Drop tail watcher for now.\n") })
   end
 end
