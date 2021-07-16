@@ -56,6 +56,7 @@ module Fluent::Plugin
       @pf_file = nil
       @pf = nil
       @ignore_list = []
+      @shutdown_start_time = nil
     end
 
     desc 'The paths to read. Multiple paths can be specified, separated by comma.'
@@ -256,6 +257,7 @@ module Fluent::Plugin
     end
 
     def shutdown
+      @shutdown_start_time = Fluent::Clock.now
       # during shutdown phase, don't close io. It should be done in close after all threads are stopped. See close.
       stop_watchers(existence_path, immediate: true, remove_watcher: false)
       @pf_file.close if @pf_file
@@ -302,7 +304,7 @@ module Fluent::Plugin
                 end
                 false
               end
-            rescue Errno::ENOENT
+            rescue Errno::ENOENT, Errno::EACCES
               log.debug("#{p} is missing after refresh file list")
               false
             end
@@ -334,8 +336,8 @@ module Fluent::Plugin
           else
             hash[target_info.path] = target_info
           end
-        rescue Errno::ENOENT
-          $log.warn "expand_paths: stat() for #{path} failed with ENOENT. Skip file."
+        rescue Errno::ENOENT, Errno::EACCES  => e
+          $log.warn "expand_paths: stat() for #{path} failed with #{e.class.name}. Skip file."
         end
       }
       hash
@@ -385,8 +387,6 @@ module Fluent::Plugin
         tw.register_watcher(tt)
       end
 
-      tw.on_notify
-
       tw.watchers.each do |watcher|
         event_loop_attach(watcher)
       end
@@ -398,7 +398,7 @@ module Fluent::Plugin
           event_loop_detach(watcher)
         end
 
-        tw.detach
+        tw.detach(@shutdown_start_time)
         tw.close
       end
       raise e
@@ -411,8 +411,8 @@ module Fluent::Plugin
         if @read_from_head && pe.read_inode.zero?
           begin
             pe.update(Fluent::FileWrapper.stat(target_info.path).ino, 0)
-          rescue Errno::ENOENT
-            $log.warn "#{target_info.path} not found. Continuing without tailing it."
+          rescue Errno::ENOENT, Errno::EACCES
+            $log.warn "stat() for #{target_info.path} failed. Continuing without tailing it."
           end
         end
       end
@@ -427,8 +427,9 @@ module Fluent::Plugin
       begin
         target_info = TargetInfo.new(target_info.path, Fluent::FileWrapper.stat(target_info.path).ino)
         @tails[target_info] = tw
-      rescue Errno::ENOENT
-        $log.warn "stat() for #{target_info.path} failed with ENOENT. Drop tail watcher for now."
+        tw.on_notify
+      rescue Errno::ENOENT, Errno::EACCES => e
+        $log.warn "stat() for #{target_info.path} failed with #{e.class.name}. Drop tail watcher for now."
         # explicitly detach and unwatch watcher `tw`.
         tw.unwatched = true
         detach_watcher(tw, target_info.ino, false)
@@ -438,6 +439,7 @@ module Fluent::Plugin
     def start_watchers(targets_info)
       targets_info.each_value {|target_info|
         construct_watcher(target_info)
+        break if before_shutdown?
       }
     end
 
@@ -490,9 +492,11 @@ module Fluent::Plugin
 
         if new_position_entry.read_inode == 0
           @tails[new_target_info] = setup_watcher(new_target_info, new_position_entry)
+          @tails[new_target_info].on_notify
         end
       else
         @tails[new_target_info] = setup_watcher(new_target_info, pe)
+        @tails[new_target_info].on_notify
       end
       detach_watcher_after_rotate_wait(rotated_tw, pe.read_inode) if rotated_tw
     end
@@ -505,7 +509,7 @@ module Fluent::Plugin
       tw.watchers.each do |watcher|
         event_loop_detach(watcher)
       end
-      tw.detach
+      tw.detach(@shutdown_start_time)
 
       tw.close if close_io
 
@@ -518,8 +522,25 @@ module Fluent::Plugin
     def detach_watcher_after_rotate_wait(tw, ino)
       # Call event_loop_attach/event_loop_detach is high-cost for short-live object.
       # If this has a problem with large number of files, use @_event_loop directly instead of timer_execute.
-      timer_execute(:in_tail_close_watcher, @rotate_wait, repeat: false) do
+      if @open_on_every_update
+        # Detach now because it's already closed, waiting it doesn't make sense.
         detach_watcher(tw, ino)
+      elsif @read_bytes_limit_per_second < 0
+        # throttling isn't enabled, just wait @rotate_wait
+        timer_execute(:in_tail_close_watcher, @rotate_wait, repeat: false) do
+          detach_watcher(tw, ino)
+        end
+      else
+        # When the throttling feature is enabled, it might not reach EOF yet.
+        # Should ensure to read all contents before closing it, with keeping throttling.
+        start_time_to_wait = Fluent::Clock.now
+        timer = timer_execute(:in_tail_close_watcher, 1, repeat: true) do
+          elapsed = Fluent::Clock.now - start_time_to_wait
+          if tw.eof? && elapsed >= @rotate_wait
+            timer.detach
+            detach_watcher(tw, ino)
+          end
+        end
       end
     end
 
@@ -717,8 +738,11 @@ module Fluent::Plugin
         @watchers << watcher
       end
 
-      def detach
-        @io_handler.on_notify if @io_handler
+      def detach(shutdown_start_time = nil)
+        if @io_handler
+          @io_handler.ready_to_shutdown(shutdown_start_time)
+          @io_handler.on_notify
+        end
         @line_buffer_timer_flusher&.close(self)
       end
 
@@ -729,10 +753,14 @@ module Fluent::Plugin
         end
       end
 
+      def eof?
+        @io_handler.eof?
+      end
+
       def on_notify
         begin
           stat = Fluent::FileWrapper.stat(@path)
-        rescue Errno::ENOENT
+        rescue Errno::ENOENT, Errno::EACCES
           # moved or deleted
           stat = nil
         end
@@ -894,6 +922,9 @@ module Fluent::Plugin
 
       class IOHandler
         BYTES_TO_READ = 8192
+        SHUTDOWN_TIMEOUT = 5
+
+        attr_accessor :shutdown_timeout
 
         def initialize(watcher, path:, read_lines_limit:, read_bytes_limit_per_second:, log:, open_on_every_update:, from_encoding: nil, encoding: nil, &receive_lines)
           @watcher = watcher
@@ -908,12 +939,25 @@ module Fluent::Plugin
           @io = nil
           @notify_mutex = Mutex.new
           @log = log
+          @start_reading_time = nil
+          @number_bytes_read = 0
+          @shutdown_start_time = nil
+          @shutdown_timeout = SHUTDOWN_TIMEOUT
+          @shutdown_mutex = Mutex.new
+          @eof = false
 
           @log.info "following tail of #{@path}"
         end
 
         def on_notify
           @notify_mutex.synchronize { handle_notify }
+        end
+
+        def ready_to_shutdown(shutdown_start_time = nil)
+          @shutdown_mutex.synchronize {
+            @shutdown_start_time =
+              shutdown_start_time || Fluent::Clock.now
+          }
         end
 
         def close
@@ -927,55 +971,68 @@ module Fluent::Plugin
           !!@io
         end
 
-        private
-
-        def read_bytes_limits_reached?(number_bytes_read)
-          number_bytes_read >= @read_bytes_limit_per_second && @read_bytes_limit_per_second > 0
+        def eof?
+          @eof
         end
 
-        def limit_bytes_per_second_reached?(start_reading, number_bytes_read)
-          return false unless read_bytes_limits_reached?(number_bytes_read)
+        private
 
-          # sleep to stop reading files when we reach the read bytes per second limit, to throttle the log ingestion
-          time_spent_reading = Fluent::Clock.now - start_reading
+        def limit_bytes_per_second_reached?
+          return false if @read_bytes_limit_per_second < 0 # not enabled by conf
+          return false if @number_bytes_read < @read_bytes_limit_per_second
+
+          @start_reading_time ||= Fluent::Clock.now
+          time_spent_reading = Fluent::Clock.now - @start_reading_time
           @log.debug("time_spent_reading: #{time_spent_reading} #{ @watcher.path}")
-          if time_spent_reading < 1
-            needed_sleeping_time = 1 - time_spent_reading
-            @log.debug("log ingestion for `#{@path}' is suspended temporary. Read it again later.")
-            return true
-          end
 
-          false
+          if time_spent_reading < 1
+            true
+          else
+            @start_reading_time = nil
+            @number_bytes_read = 0
+            false
+          end
+        end
+
+        def should_shutdown_now?
+          # Ensure to read all remaining lines, but abort immediately if it
+          # seems to take too long time.
+          @shutdown_mutex.synchronize {
+            return false if @shutdown_start_time.nil?
+            return Fluent::Clock.now - @shutdown_start_time > @shutdown_timeout
+          }
         end
 
         def handle_notify
+          return if limit_bytes_per_second_reached?
+
           with_io do |io|
             begin
-              number_bytes_read = 0
-              start_reading = Fluent::Clock.now
               read_more = false
 
               if !io.nil? && @lines.empty?
                 begin
                   while true
+                    @start_reading_time ||= Fluent::Clock.now
                     data = io.readpartial(BYTES_TO_READ, @iobuf)
-                    number_bytes_read += data.bytesize
+                    @eof = false
+                    @number_bytes_read += data.bytesize
                     @fifo << data
                     @fifo.read_lines(@lines)
 
-                    @log.debug("reading file: #{@path}")
+                    if limit_bytes_per_second_reached? || should_shutdown_now?
+                      # Just get out from tailing loop.
+                      read_more = false
+                      break
+                    end
                     if @lines.size >= @read_lines_limit
                       # not to use too much memory in case the file is very large
                       read_more = true
                       break
                     end
-                    if limit_bytes_per_second_reached?(start_reading, number_bytes_read)
-                      # Just get out from tailing loop.
-                      read_more = false
-                      break
-                    end
                   end
                 rescue EOFError
+                  @eof = true
                 end
               end
 
@@ -998,7 +1055,7 @@ module Fluent::Plugin
         rescue RangeError
           io.close if io
           raise WatcherSetupError, "seek error with #{@path}: file position = #{@watcher.pe.read_pos.to_s(16)}, reading bytesize = #{@fifo.bytesize.to_s(16)}"
-        rescue Errno::ENOENT
+        rescue Errno::ENOENT, Errno::EACCES
           nil
         end
 
@@ -1013,14 +1070,17 @@ module Fluent::Plugin
           else
             @io ||= open
             yield @io
+            @eof = true if @io.nil?
           end
         rescue WatcherSetupError => e
           close
+          @eof = true
           raise e
         rescue
           @log.error $!.to_s
           @log.error_backtrace
           close
+          @eof = true
         end
       end
 

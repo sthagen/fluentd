@@ -345,53 +345,201 @@ class TailInputTest < Test::Unit::TestCase
         cleanup_file("#{TMP_DIR}/tail.txt")
       end
 
-      data("flat 8192 bytes, 2 events"        => [:flat, 100, 8192, 2],
-           "flat 8192 bytes, 2 events w/o stat watcher" => [:flat_without_stat, 100, 8192, 2],
-           "flat #{8192*10} bytes, 20 events"  => [:flat, 100, (8192 * 10), 20],
-           "flat #{8192*10} bytes, 20 events w/o stat watcher"  => [:flat_without_stat, 100, (8192 * 10), 20],
-           "parse #{8192*4} bytes, 8 events"  => [:parse, 100, (8192 * 4), 8],
-           "parse #{8192*4} bytes, 8 events w/o stat watcher"  => [:parse_without_stat, 100, (8192 * 4), 8],
-           "parse #{8192*10} bytes, 20 events" => [:parse, 100, (8192 * 10), 20],
-           "parse #{8192*10} bytes, 20 events w/o stat watcher" => [:parse_without_stat, 100, (8192 * 10), 20],
-           "flat 8k bytes with unit, 2 events"        => [:flat, 100, "8k", 2],
-           "flat 8k bytes with unit, 2 events w/o stat watcher"        => [:flat_without_stat, 100, "8k", 2],
-           "flat #{8*10}k bytes with unit, 20 events"  => [:flat, 100, "#{8*10}k", 20],
-           "flat #{8*10}k bytes with unit, 20 events w/o stat watcher"  => [:flat_without_stat, 100, "#{8*10}k", 20],
-           "parse #{8*4}k bytes with unit, 8 events"  => [:parse, 100, "#{8*4}k", 8],
-           "parse #{8*4}k bytes with unit, 8 events w/o stat watcher"  => [:parse_without_stat, 100, "#{8*4}k", 8],
-           "parse #{8*10}k bytes with unit, 20 events" => [:parse, 100, "#{8*10}k", 20],
-           "parse #{8*10}k bytes with unit, 20 events w/o stat watcher" => [:parse_without_stat, 100, "#{8*10}k", 20])
-      def test_emit_with_read_bytes_limit_per_second(data)
-        config_style, limit, limit_bytes, num_events = data
-        case config_style
-        when :flat
-          config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes })
-        when :parse
-          config = CONFIG_READ_FROM_HEAD + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes }) + PARSE_SINGLE_LINE_CONFIG
-        when :flat_without_stat
-          config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + CONFIG_DISABLE_STAT_WATCHER + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes })
-        when :parse_without_stat
-          config = CONFIG_READ_FROM_HEAD + CONFIG_DISABLE_STAT_WATCHER + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes }) + PARSE_SINGLE_LINE_CONFIG
-        end
-        d = create_driver(config)
-        msg = 'test' * 2000 # in_tail reads 8192 bytes at once.
+      sub_test_case "reads_bytes_per_second w/o throttled" do
+        data("flat 8192 bytes, 2 events"        => [:flat, 100, 8192, 2],
+             "flat 8192 bytes, 2 events w/o stat watcher" => [:flat_without_stat, 100, 8192, 2],
+             "flat #{8192*10} bytes, 20 events"  => [:flat, 100, (8192 * 10), 20],
+             "flat #{8192*10} bytes, 20 events w/o stat watcher"  => [:flat_without_stat, 100, (8192 * 10), 20],
+             "parse #{8192*4} bytes, 8 events"  => [:parse, 100, (8192 * 4), 8],
+             "parse #{8192*4} bytes, 8 events w/o stat watcher"  => [:parse_without_stat, 100, (8192 * 4), 8],
+             "parse #{8192*10} bytes, 20 events" => [:parse, 100, (8192 * 10), 20],
+             "parse #{8192*10} bytes, 20 events w/o stat watcher" => [:parse_without_stat, 100, (8192 * 10), 20],
+             "flat 8k bytes with unit, 2 events" => [:flat, 100, "8k", 2])
+        def test_emit_with_read_bytes_limit_per_second(data)
+          config_style, limit, limit_bytes, num_events = data
+          case config_style
+          when :flat
+            config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes })
+          when :parse
+            config = CONFIG_READ_FROM_HEAD + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes }) + PARSE_SINGLE_LINE_CONFIG
+          when :flat_without_stat
+            config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + CONFIG_DISABLE_STAT_WATCHER + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes })
+          when :parse_without_stat
+            config = CONFIG_READ_FROM_HEAD + CONFIG_DISABLE_STAT_WATCHER + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes }) + PARSE_SINGLE_LINE_CONFIG
+          end
 
-        # We should not do shutdown here due to hard timeout.
-        d.run(expect_emits: 2, shutdown: false) do
-          File.open("#{TMP_DIR}/tail.txt", "ab") {|f|
-            for _x in 0..30
+          msg = 'test' * 2000 # in_tail reads 8192 bytes at once.
+          start_time = Fluent::Clock.now
+
+          d = create_driver(config)
+          d.run(expect_emits: 2) do
+            File.open("#{TMP_DIR}/tail.txt", "ab") {|f|
+              100.times do
+                f.puts msg
+              end
+            }
+          end
+
+          assert_true(Fluent::Clock.now - start_time > 1)
+          assert_equal(num_events.times.map { {"message" => msg} },
+                       d.events.collect { |event| event[2] })
+        end
+
+        def test_read_bytes_limit_precede_read_lines_limit
+          config = CONFIG_READ_FROM_HEAD +
+                   SINGLE_LINE_CONFIG +
+                   config_element("", "", {
+                                    "read_lines_limit" => 1000,
+                                    "read_bytes_limit_per_second" => 8192
+                                  })
+          msg = 'abc'
+          start_time = Fluent::Clock.now
+          d = create_driver(config)
+          d.run(expect_emits: 2) do
+            File.open("#{TMP_DIR}/tail.txt", "ab") {|f|
+              8000.times do
+                f.puts msg
+              end
+            }
+          end
+
+          assert_true(Fluent::Clock.now - start_time > 1)
+          assert_equal(4096.times.map { {"message" => msg} },
+                       d.events.collect { |event| event[2] })
+        end
+      end
+
+      sub_test_case "reads_bytes_per_second w/ throttled already" do
+        data("flat 8192 bytes"  => [:flat, 100, 8192],
+             "parse 8192 bytes" => [:parse, 100, 8192])
+        def test_emit_with_read_bytes_limit_per_second(data)
+          config_style, limit, limit_bytes = data
+          case config_style
+          when :flat
+            config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes })
+          when :parse
+            config = CONFIG_READ_FROM_HEAD + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes }) + PARSE_SINGLE_LINE_CONFIG
+          end
+          d = create_driver(config)
+          msg = 'test' * 2000 # in_tail reads 8192 bytes at once.
+
+          mock.proxy(d.instance).io_handler(anything, anything) do |io_handler|
+            require 'fluent/config/types'
+            limit_bytes_value = Fluent::Config.size_value(limit_bytes)
+            io_handler.instance_variable_set(:@number_bytes_read, limit_bytes_value)
+            if Fluent.linux?
+              mock.proxy(io_handler).handle_notify.at_least(5)
+            else
+              mock.proxy(io_handler).handle_notify.twice
+            end
+            io_handler
+          end
+
+          File.open("#{TMP_DIR}/tail.txt", "ab") do |f|
+            100.times do
               f.puts msg
             end
-          }
+          end
+
+          # We should not do shutdown here due to hard timeout.
+          d.run do
+            start_time = Fluent::Clock.now
+            while Fluent::Clock.now - start_time < 0.8 do
+              File.open("#{TMP_DIR}/tail.txt", "ab") do |f|
+                f.puts msg
+                f.flush
+              end
+              sleep 0.05
+            end
+          end
+
+          assert_equal([], d.events)
+        end
+      end
+
+      sub_test_case "EOF with reads_bytes_per_second" do
+        def test_longer_than_rotate_wait
+          limit_bytes = 8192
+          num_lines = 1024 * 3
+          msg = "08bytes"
+
+          File.open("#{TMP_DIR}/tail.txt", "wb") do |f|
+            f.write("#{msg}\n" * num_lines)
+          end
+
+          config = CONFIG_READ_FROM_HEAD +
+                   SINGLE_LINE_CONFIG +
+                   config_element("", "", {
+                                    "read_bytes_limit_per_second" => limit_bytes,
+                                    "rotate_wait" => 0.1,
+                                    "refresh_interval" => 0.5,
+                                  })
+
+          rotated = false
+          d = create_driver(config)
+          d.run(timeout: 10) do
+            while d.events.size < num_lines do
+              if d.events.size > 0 && !rotated
+                cleanup_file("#{TMP_DIR}/tail.txt")
+                FileUtils.touch("#{TMP_DIR}/tail.txt")
+                rotated = true
+              end
+              sleep 0.3
+            end
+          end
+
+          assert_equal(num_lines,
+                       d.events.count do |event|
+                         event[2]["message"] == msg
+                       end)
         end
 
-        events = d.events
-        assert_true(events.length <= num_events)
-        assert_equal({"message" => msg}, events[0][2])
-        assert_equal({"message" => msg}, events[1][2])
+        def test_shorter_than_rotate_wait
+          limit_bytes = 8192
+          num_lines = 1024 * 2
+          msg = "08bytes"
 
-        # Teardown in_tail plugin instance here.
-        d.instance.shutdown
+          File.open("#{TMP_DIR}/tail.txt", "wb") do |f|
+            f.write("#{msg}\n" * num_lines)
+          end
+
+          config = CONFIG_READ_FROM_HEAD +
+                   SINGLE_LINE_CONFIG +
+                   config_element("", "", {
+                                    "read_bytes_limit_per_second" => limit_bytes,
+                                    "rotate_wait" => 2,
+                                    "refresh_interval" => 0.5,
+                                  })
+
+          start_time = Fluent::Clock.now
+          rotated = false
+          detached = false
+          d = create_driver(config)
+          mock.proxy(d.instance).setup_watcher(anything, anything) do |tw|
+            mock.proxy(tw).detach(anything) do |v|
+              detached = true
+              v
+            end
+            tw
+          end.twice
+
+          d.run(timeout: 10) do
+            until detached do
+              if d.events.size > 0 && !rotated
+                cleanup_file("#{TMP_DIR}/tail.txt")
+                FileUtils.touch("#{TMP_DIR}/tail.txt")
+                rotated = true
+              end
+              sleep 0.3
+            end
+          end
+
+          assert_true(Fluent::Clock.now - start_time > 2)
+          assert_equal(num_lines,
+                       d.events.count do |event|
+                         event[2]["message"] == msg
+                       end)
+        end
       end
     end
 
@@ -2007,6 +2155,82 @@ class TailInputTest < Test::Unit::TestCase
       d.run(shutdown: false) {}
     end
     d.instance_shutdown
-    assert($log.out.logs.any?{|log| log.include?("stat() for #{path} failed with ENOENT. Drop tail watcher for now.\n") })
+    assert($log.out.logs.any?{|log| log.include?("stat() for #{path} failed with Errno::ENOENT. Drop tail watcher for now.\n") })
+  end
+
+  def test_EACCES_error_after_setup_watcher
+    omit "Cannot test with root user" if Process::UID.eid == 0
+    path = "#{TMP_DIR}/noaccess/tail.txt"
+    begin
+      FileUtils.mkdir_p("#{TMP_DIR}/noaccess")
+      FileUtils.chmod(0755, "#{TMP_DIR}/noaccess")
+      FileUtils.touch(path)
+      config = config_element('', '', {
+                                'tag' => "tail",
+                                'path' => path,
+                                'format' => 'none',
+                              })
+      d = create_driver(config, false)
+      mock.proxy(d.instance).setup_watcher(anything, anything) do |tw|
+        FileUtils.chmod(0000, "#{TMP_DIR}/noaccess")
+        tw
+      end
+      assert_nothing_raised do
+        d.run(shutdown: false) {}
+      end
+      d.instance_shutdown
+      assert($log.out.logs.any?{|log| log.include?("stat() for #{path} failed with Errno::EACCES. Drop tail watcher for now.\n") })
+    end
+  ensure
+    if File.exist?("#{TMP_DIR}/noaccess")
+      FileUtils.chmod(0755, "#{TMP_DIR}/noaccess")
+      FileUtils.rm_rf("#{TMP_DIR}/noaccess")
+    end
+  end unless Fluent.windows?
+
+  def test_EACCES
+    path = "#{TMP_DIR}/tail.txt"
+    FileUtils.touch(path)
+    config = config_element('', '', {
+                              'format' => 'none',
+                            })
+    d = create_driver(config)
+    mock.proxy(Fluent::FileWrapper).stat(path) do |stat|
+      raise Errno::EACCES
+    end.at_least(1)
+    assert_nothing_raised do
+      d.run(shutdown: false) {}
+    end
+    d.instance_shutdown
+    assert($log.out.logs.any?{|log| log.include?("expand_paths: stat() for #{path} failed with Errno::EACCES. Skip file.\n") })
+  end
+
+  def test_shutdown_timeout
+    path = "#{TMP_DIR}/tail.txt"
+    File.open("#{TMP_DIR}/tail.txt", "wb") do |f|
+      (1024 * 1024 * 5).times do
+        f.puts "{\"test\":\"fizzbuzz\"}"
+      end
+    end
+
+    config =
+      CONFIG_READ_FROM_HEAD +
+      config_element('', '', {
+                              'format' => 'json',
+                              'skip_refresh_on_startup' => true,
+                            })
+    d = create_driver(config)
+    mock.proxy(d.instance).io_handler(anything, anything) do |io_handler|
+      io_handler.shutdown_timeout = 0.5
+      io_handler
+    end
+
+    start_time = Fluent::Clock.now
+    assert_nothing_raised do
+      d.run(expect_emits: 1)
+    end
+
+    elapsed = Fluent::Clock.now - start_time
+    assert_true(elapsed > 0.5 && elapsed < 2.5)
   end
 end

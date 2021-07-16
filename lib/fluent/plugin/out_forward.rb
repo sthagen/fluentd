@@ -565,8 +565,6 @@ module Fluent::Plugin
           username: server.username || '',
         )
 
-        @unpacker = Fluent::MessagePackFactory.msgpack_unpacker
-
         @resolved_host = nil
         @resolved_time = 0
         @resolved_once = false
@@ -613,7 +611,7 @@ module Fluent::Plugin
               sleep @sender.read_interval
               next
             end
-            @unpacker.feed_each(buf) do |data|
+            Fluent::MessagePackFactory.msgpack_unpacker.feed_each(buf) do |data|
               if @handshake.invoke(sock, ri, data) == :established
                 @log.debug "connection established", host: @host, port: @port
               end

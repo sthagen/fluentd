@@ -58,6 +58,15 @@ class FileWrapperTest < Test::Unit::TestCase
       assert_equal("#<Fluent::Win32Error: code: 32, The process cannot access the file because it is being used by another process. - C:\file.txt>",
                    Fluent::Win32Error.new(ERROR_SHARING_VIOLATION, "C:\file.txt").inspect)
     end
+
+    data('0' => [false, 0],
+         '9999' => [false, 9999],
+         '10000' => [true, 10000],
+         '10001' => [true, 10001])
+    test 'wsaerr?' do |data|
+      expected, code = data
+      assert_equal(expected, Fluent::Win32Error.new(code).wsaerr?)
+    end
   end
 
   sub_test_case 'WindowsFile exceptions' do
@@ -87,12 +96,24 @@ class FileWrapperTest < Test::Unit::TestCase
       end
     end
 
+    test 'Errno::ENOENT raised on DeletePending' do
+      path = "#{TMP_DIR}/deletepending.txt"
+      file = Fluent::WindowsFile.new(path, mode='w')
+      File.delete(path)
+      assert_raise(Errno::ENOENT) do
+        file.stat
+      ensure
+        file.close if file
+      end
+    end
+
     test 'ERROR_SHARING_VIOLATION raised' do
       begin
         path = "#{TMP_DIR}/test_windows_file.txt"
         file1 = file2 = nil
         file1 = File.open(path, "wb")
-        assert_raise(Fluent::Win32Error.new(ERROR_SHARING_VIOLATION, path)) do
+        win32err = Fluent::Win32Error.new(ERROR_SHARING_VIOLATION, path)
+        assert_raise(Errno::EACCES.new(win32err.message)) do
           file2 = Fluent::WindowsFile.new(path, 'r', FILE_SHARE_READ)
         ensure
           file2.close if file2
